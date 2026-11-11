@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Renewal Radar</title>
+<style>
+  :root { --ink:#14161c; --muted:#5d6472; --line:#e3e6ec; --brand:#4a4cf0; --bg:#f6f7fb; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color:var(--ink); background:var(--bg); }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 48px 20px; display:grid; gap:40px; grid-template-columns: 1.2fr 1fr; align-items:center; }
+  @media (max-width: 760px) { .wrap { grid-template-columns: 1fr; } }
+  .logo { font-weight:700; color:var(--brand); letter-spacing:.2px; margin-bottom:18px; }
+  h1 { font-size: 40px; line-height:1.1; margin: 0 0 14px; }
+  p.lead { font-size:17px; color:var(--muted); line-height:1.55; margin:0 0 18px; }
+  ul { color:var(--muted); line-height:1.8; padding-left:20px; margin:0; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:14px; padding:24px; }
+  .tabs { display:flex; gap:8px; margin-bottom:16px; }
+  .tabs button { flex:1; padding:9px; border:1px solid var(--line); background:#fff; border-radius:8px; cursor:pointer; font-weight:600; color:var(--muted); }
+  .tabs button.on { background:var(--brand); border-color:var(--brand); color:#fff; }
+  label { display:block; font-size:13px; font-weight:600; margin:12px 0 5px; }
+  input { width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:8px; font-size:15px; }
+  .go { width:100%; margin-top:18px; padding:11px; border:0; border-radius:8px; background:var(--brand); color:#fff; font-size:15px; font-weight:600; cursor:pointer; }
+  .err { color:#c0262d; font-size:13px; min-height:18px; margin-top:10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div>
+    <div class="logo">Renewal Radar</div>
+    <h1>Never get surprised by an auto-renewal again.</h1>
+    <p class="lead">Tell Claude about a subscription or paste an invoice. Renewal Radar saves it, tracks the date, and emails you before you get charged.</p>
+    <ul>
+      <li>Claude reads your invoices and contracts</li>
+      <li>You review and edit everything here</li>
+      <li>Alerts arrive before the renewal date</li>
+    </ul>
+  </div>
+  <div class="card">
+    <div class="tabs">
+      <button id="tabUp" class="on" type="button">Sign up</button>
+      <button id="tabIn" type="button">Log in</button>
+    </div>
+    <form id="f">
+      <label for="email">Email</label>
+      <input id="email" type="email" autocomplete="email" required>
+      <label for="pw">Password</label>
+      <input id="pw" type="password" autocomplete="current-password" minlength="6" required>
+      <button class="go" id="go" type="submit">Create my account</button>
+      <div class="err" id="err"></div>
+    </form>
+  </div>
+</div>
+<script>
+  let mode = "signup";
+  const $ = (s) => document.querySelector(s);
+  function setMode(m) {
+    mode = m;
+    $("#tabUp").classList.toggle("on", m === "signup");
+    $("#tabIn").classList.toggle("on", m === "login");
+    $("#go").textContent = m === "signup" ? "Create my account" : "Log in";
+    $("#err").textContent = "";
+  }
+  $("#tabUp").onclick = () => setMode("signup");
+  $("#tabIn").onclick = () => setMode("login");
+  $("#f").onsubmit = async (e) => {
+    e.preventDefault();
+    $("#err").textContent = "";
+    try {
+      const r = await fetch(mode === "signup" ? "/api/signup" : "/api/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: $("#email").value, password: $("#pw").value }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || "Something went wrong");
+      location.href = "/app";
+    } catch (err) {
+      $("#err").textContent = err.message;
+    }
+  };
+</script>
+</body>
+</html>

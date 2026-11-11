@@ -1,0 +1,19 @@
+{
+  "name": "renewal-radar",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Track software renewals from Claude. No AI inside this app.",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.0",
+    "express": "^4.21.0",
+    "pg": "^8.12.0",
+    "zod": "^3.25.0"
+  }
+}

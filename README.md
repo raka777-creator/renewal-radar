@@ -2,8 +2,8 @@
 
 Track software and vendor renewals straight from Claude. Claude reads your invoices and contracts and does all the thinking. This app stores the data, lets a person review and edit it, and emails alerts before an auto-renewal hits. **There is no AI inside this app: no AI keys, no AI libraries, no AI cost.**
 
-- **Live app:** `<PASTE YOUR LIVE URL>`
-- **Test login:** `<PASTE TEST EMAIL>` / `<PASTE TEST PASSWORD>`
+- **Live app:** `https://renewal-radar-msgh.onrender.com`
+- **Test login:** `demo@renewalradar.app` / `RenewalDemo2026`
 
 ## Connect it to Claude (2 minutes)
 

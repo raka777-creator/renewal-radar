@@ -47,6 +47,9 @@ CREATE TABLE IF NOT EXISTS renewals (
   last_alert_for DATE,
   created_at TIMESTAMPTZ DEFAULT now()
 );
+ALTER TABLE renewals ADD COLUMN IF NOT EXISTS decision TEXT NOT NULL DEFAULT 'undecided';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS cal_token TEXT UNIQUE;
+UPDATE users SET cal_token = md5(random()::text || id::text || clock_timestamp()::text) WHERE cal_token IS NULL;
 `);
 
 // ---------- Passwords and sessions (no extra libraries) ----------
@@ -79,8 +82,9 @@ function readSession(req) {
 // ---------- Renewal data helpers ----------
 const CYCLES = ["monthly", "quarterly", "yearly"];
 const CYCLE_MONTHS = { monthly: 1, quarterly: 3, yearly: 12 };
+const DECISIONS = ["undecided", "keep", "cancel", "renegotiate"];
 const COLS = `id, vendor, plan, amount::float8 AS amount, currency, billing_cycle,
-  renewal_date::text AS renewal_date, auto_renews, notice_days, owner, notes`;
+  renewal_date::text AS renewal_date, auto_renews, notice_days, owner, notes, decision`;
 
 function clean(b, partial) {
   const o = {};
@@ -100,6 +104,10 @@ function clean(b, partial) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(b.renewal_date) || isNaN(Date.parse(b.renewal_date)))
       throw new Error("renewal_date must look like 2026-12-31");
     o.renewal_date = b.renewal_date;
+  }
+  if (b.decision !== undefined) {
+    if (!DECISIONS.includes(b.decision)) throw new Error("decision must be undecided, keep, cancel or renegotiate");
+    o.decision = b.decision;
   }
   if (b.auto_renews !== undefined) o.auto_renews = b.auto_renews === true || b.auto_renews === "true";
   if (b.notice_days !== undefined) {
@@ -122,15 +130,15 @@ async function listRenewals(userId) {
   return r.rows;
 }
 async function createRenewal(userId, o) {
-  const f = { billing_cycle: "yearly", currency: "INR", auto_renews: true, notice_days: 14, amount: 0, ...o };
+  const f = { billing_cycle: "yearly", currency: "INR", auto_renews: true, notice_days: 14, amount: 0, decision: "undecided", ...o };
   const r = await pool.query(
-    `INSERT INTO renewals (user_id,vendor,plan,amount,currency,billing_cycle,renewal_date,auto_renews,notice_days,owner,notes)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING ${COLS}`,
-    [userId, f.vendor, f.plan, f.amount, f.currency, f.billing_cycle, f.renewal_date, f.auto_renews, f.notice_days, f.owner, f.notes]
+    `INSERT INTO renewals (user_id,vendor,plan,amount,currency,billing_cycle,renewal_date,auto_renews,notice_days,owner,notes,decision)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING ${COLS}`,
+    [userId, f.vendor, f.plan, f.amount, f.currency, f.billing_cycle, f.renewal_date, f.auto_renews, f.notice_days, f.owner, f.notes, f.decision]
   );
   return r.rows[0];
 }
-const FIELDS = ["vendor", "plan", "amount", "currency", "billing_cycle", "renewal_date", "auto_renews", "notice_days", "owner", "notes"];
+const FIELDS = ["vendor", "plan", "amount", "currency", "billing_cycle", "renewal_date", "auto_renews", "notice_days", "owner", "notes", "decision"];
 async function updateRenewal(userId, id, patch) {
   const vals = [userId, id];
   const sets = [];
@@ -153,20 +161,86 @@ async function deleteRenewal(userId, id) {
 
 const today = () => Date.parse(new Date().toISOString().slice(0, 10));
 const daysUntil = (d) => Math.round((Date.parse(d) - today()) / 864e5);
+// Active spend excludes renewals marked "cancel". Those count as money saved per year instead.
 function summarize(rows) {
   const by = {};
+  const r2 = (n) => Math.round(n * 100) / 100;
   for (const r of rows) {
-    const c = (by[r.currency] ||= { currency: r.currency, monthly_total: 0, yearly_total: 0, count: 0 });
+    const c = (by[r.currency] ||= { currency: r.currency, monthly_total: 0, yearly_total: 0, saved_per_year: 0, active_count: 0, cancelled_count: 0 });
     const monthly = r.amount / CYCLE_MONTHS[r.billing_cycle];
-    c.monthly_total += monthly;
-    c.yearly_total += monthly * 12;
-    c.count++;
+    if (r.decision === "cancel") {
+      c.saved_per_year += monthly * 12;
+      c.cancelled_count++;
+    } else {
+      c.monthly_total += monthly;
+      c.yearly_total += monthly * 12;
+      c.active_count++;
+    }
   }
   for (const c of Object.values(by)) {
-    c.monthly_total = Math.round(c.monthly_total * 100) / 100;
-    c.yearly_total = Math.round(c.yearly_total * 100) / 100;
+    c.monthly_total = r2(c.monthly_total);
+    c.yearly_total = r2(c.yearly_total);
+    c.saved_per_year = r2(c.saved_per_year);
   }
   return Object.values(by);
+}
+
+// ---------- Calendar feed (.ics), works in Google Calendar, Outlook and Apple Calendar ----------
+const RRULES = { monthly: "FREQ=MONTHLY", quarterly: "FREQ=MONTHLY;INTERVAL=3", yearly: "FREQ=YEARLY" };
+const icsText = (s) => String(s ?? "").replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\r?\n/g, "\\n");
+const icsDate = (d) => d.replace(/-/g, "");
+const shiftDate = (d, days) => new Date(Date.parse(d + "T00:00:00Z") + days * 864e5).toISOString().slice(0, 10);
+function icsFold(line) {
+  const out = [];
+  while (line.length > 73) {
+    out.push(line.slice(0, 73));
+    line = " " + line.slice(73);
+  }
+  out.push(line);
+  return out.join("\r\n");
+}
+function buildCalendar(rows) {
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15) + "Z";
+  const lines = [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//Renewal Radar//EN",
+    "CALSCALE:GREGORIAN",
+    "METHOD:PUBLISH",
+    "X-WR-CALNAME:Renewal Radar",
+    "X-PUBLISHED-TTL:PT1H",
+  ];
+  const event = (uid, date, summary, description, rrule) => {
+    lines.push("BEGIN:VEVENT", `UID:${uid}`, `DTSTAMP:${stamp}`, `DTSTART;VALUE=DATE:${icsDate(date)}`,
+      `DTEND;VALUE=DATE:${icsDate(shiftDate(date, 1))}`, `SUMMARY:${icsText(summary)}`, `DESCRIPTION:${icsText(description)}`);
+    if (rrule) lines.push(`RRULE:${rrule}`);
+    lines.push("TRANSP:TRANSPARENT", "END:VEVENT");
+  };
+  for (const r of rows) {
+    const cost = `${r.currency} ${r.amount}`;
+    const cancelled = r.decision === "cancel";
+    const rrule = cancelled ? null : RRULES[r.billing_cycle];
+    const details = [
+      `${r.vendor}${r.plan ? " (" + r.plan + ")" : ""}: ${cost} per ${r.billing_cycle.replace("ly", "")}`,
+      `Decision: ${r.decision}`,
+      r.owner ? `Owner: ${r.owner}` : "",
+      `Edit: ${BASE_URL}/app?edit=${r.id}`,
+    ].filter(Boolean).join("\n");
+    event(`rr-${r.id}-renew@renewal-radar`, r.renewal_date,
+      cancelled ? `Cancel ${r.vendor} before it renews today` : `${r.vendor} renews (${cost})`, details, rrule);
+    if (r.notice_days > 0) {
+      const lead = {
+        undecided: `Decide on ${r.vendor}: keep or cancel?`,
+        keep: `Heads up: ${r.vendor}`,
+        cancel: `Cancel ${r.vendor} now`,
+        renegotiate: `Renegotiate ${r.vendor} now`,
+      }[r.decision] || `${r.vendor} renews soon`;
+      event(`rr-${r.id}-notice@renewal-radar`, shiftDate(r.renewal_date, -r.notice_days),
+        `${lead} (renews in ${r.notice_days} days, ${cost})`, details, rrule);
+    }
+  }
+  lines.push("END:VCALENDAR");
+  return lines.map(icsFold).join("\r\n") + "\r\n";
 }
 const withDays = (r) => ({ ...r, days_left: daysUntil(r.renewal_date), edit_link: `${BASE_URL}/app?edit=${r.id}` });
 
@@ -220,7 +294,7 @@ function buildMcp(user) {
     { name: "renewal-radar", version: "1.0.0" },
     {
       instructions:
-        "Renewal Radar tracks a company's software and service renewals. When the user shares an invoice, contract, receipt or email about a subscription, extract the vendor, plan, amount, currency, billing cycle and next renewal date and call add_renewal. Always give the user the edit_link from the result so they can review it. Dates must be YYYY-MM-DD.",
+        "Renewal Radar tracks a company's software and service renewals. When the user shares an invoice, contract, receipt or email about a subscription, extract the vendor, plan, amount, currency, billing cycle and next renewal date and call add_renewal. Always give the user the edit_link from the result so they can review it. Dates must be YYYY-MM-DD. When the user decides to keep, cancel or renegotiate a renewal, call set_decision. Renewals marked cancel count as money saved. spend_summary also returns a calendar_feed link the user can add to Google Calendar, Outlook or Apple Calendar.",
     }
   );
   const ok = (obj) => ({ content: [{ type: "text", text: typeof obj === "string" ? obj : JSON.stringify(obj, null, 2) }] });
@@ -250,9 +324,37 @@ function buildMcp(user) {
         notice_days: z.number().int().optional().describe("Days before renewal to send an alert. Default 14"),
         owner: z.string().optional().describe("Person or team responsible"),
         notes: z.string().optional().describe("Cancellation terms, contract notes, anything useful"),
+        decision: z.enum(["undecided", "keep", "cancel", "renegotiate"]).optional().describe("Default undecided"),
       },
     },
     run(async (a) => withDays(await createRenewal(user.id, clean(a, false))))
+  );
+
+  server.registerTool(
+    "set_decision",
+    {
+      title: "Keep, cancel or renegotiate",
+      description:
+        "Record what the team decided about a renewal: keep, cancel, renegotiate, or undecided. Renewals marked cancel stop counting as spend and count as money saved per year. Get the id from list_renewals.",
+      inputSchema: {
+        id: z.number().int(),
+        decision: z.enum(["undecided", "keep", "cancel", "renegotiate"]),
+        reason: z.string().optional().describe("Short reason, saved into the notes"),
+      },
+    },
+    run(async ({ id, decision, reason }) => {
+      const row = await updateRenewal(user.id, id, { decision });
+      if (reason) {
+        const line = `Decision (${decision}): ${String(reason).trim().slice(0, 300)}`;
+        await pool.query(
+          "UPDATE renewals SET notes = CASE WHEN notes IS NULL OR notes = '' THEN $3 ELSE notes || E'\\n' || $3 END WHERE user_id=$1 AND id=$2",
+          [user.id, id, line]
+        );
+        row.notes = row.notes ? row.notes + "\n" + line : line;
+      }
+      const saved = summarize(await listRenewals(user.id)).map((c) => ({ currency: c.currency, saved_per_year: c.saved_per_year }));
+      return { ...withDays(row), total_saved_per_year: saved };
+    })
   );
 
   server.registerTool(
@@ -295,6 +397,7 @@ function buildMcp(user) {
         notice_days: z.number().int().optional(),
         owner: z.string().optional(),
         notes: z.string().optional(),
+        decision: z.enum(["undecided", "keep", "cancel", "renegotiate"]).optional(),
       },
     },
     run(async ({ id, ...patch }) => withDays(await updateRenewal(user.id, id, clean(patch, true))))
@@ -317,13 +420,15 @@ function buildMcp(user) {
     "spend_summary",
     {
       title: "Spend summary",
-      description: "Total recurring spend per currency (monthly and yearly equivalent) plus the next 5 renewals.",
+      description:
+        "Active recurring spend per currency (monthly and yearly), money saved per year from cancelled renewals, the next 5 renewals, and the user's calendar feed link.",
       inputSchema: {},
     },
     run(async () => {
       const rows = await listRenewals(user.id);
       return {
         dashboard: `${BASE_URL}/app`,
+        calendar_feed: `${BASE_URL}/calendar/${user.cal_token}.ics`,
         spend_by_currency: summarize(rows),
         next_five: rows.map(withDays).filter((r) => r.days_left >= 0).slice(0, 5),
       };
@@ -346,7 +451,7 @@ async function requireUser(req, res, next) {
   try {
     const id = readSession(req);
     if (!id) return res.status(401).json({ error: "Not logged in" });
-    const r = await pool.query("SELECT id, email, token FROM users WHERE id=$1", [id]);
+    const r = await pool.query("SELECT id, email, token, cal_token FROM users WHERE id=$1", [id]);
     if (!r.rows[0]) return res.status(401).json({ error: "Not logged in" });
     req.user = r.rows[0];
     next();
@@ -368,10 +473,11 @@ app.post("/api/signup", wrap(async (req, res) => {
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new Error("Enter a valid email");
   if (password.length < 6) throw new Error("Password must be at least 6 characters");
   try {
-    const r = await pool.query("INSERT INTO users (email, pw_hash, token) VALUES ($1,$2,$3) RETURNING id", [
+    const r = await pool.query("INSERT INTO users (email, pw_hash, token, cal_token) VALUES ($1,$2,$3,$4) RETURNING id", [
       email,
       hashPw(password),
       crypto.randomBytes(24).toString("hex"),
+      crypto.randomBytes(16).toString("hex"),
     ]);
     res.setHeader("Set-Cookie", makeCookie(r.rows[0].id));
     res.json({ ok: true });
@@ -395,8 +501,28 @@ app.post("/api/logout", (req, res) => {
 });
 
 app.get("/api/me", requireUser, (req, res) =>
-  res.json({ email: req.user.email, mcp_url: `${BASE_URL}/mcp/${req.user.token}` })
+  res.json({
+    email: req.user.email,
+    mcp_url: `${BASE_URL}/mcp/${req.user.token}`,
+    calendar_url: `${BASE_URL}/calendar/${req.user.cal_token}.ics`,
+  })
 );
+
+// Calendar feed: a private link people add to their calendar app. No login, the secret in the link is the key.
+app.get("/calendar/:file", async (req, res) => {
+  try {
+    const token = String(req.params.file).replace(/\.ics$/i, "");
+    const u = await pool.query("SELECT id FROM users WHERE cal_token=$1", [token]);
+    if (!u.rows[0]) return res.status(404).send("Calendar not found");
+    res.set("Content-Type", "text/calendar; charset=utf-8");
+    res.set("Content-Disposition", 'inline; filename="renewal-radar.ics"');
+    res.set("Cache-Control", "no-cache");
+    res.send(buildCalendar(await listRenewals(u.rows[0].id)));
+  } catch (e) {
+    console.error(e);
+    res.status(500).send("Calendar error");
+  }
+});
 app.get("/api/renewals", requireUser, wrap(async (req, res) => res.json({ renewals: await listRenewals(req.user.id) })));
 app.post("/api/renewals", requireUser, wrap(async (req, res) => res.json(await createRenewal(req.user.id, clean(req.body, false)))));
 app.put("/api/renewals/:id", requireUser, wrap(async (req, res) =>
@@ -411,7 +537,7 @@ app.post("/api/send-alerts", requireUser, wrap(async (req, res) => res.json(awai
 // MCP endpoint: one secret link per customer. Stateless, works on any host.
 app.post("/mcp/:token", async (req, res) => {
   try {
-    const r = await pool.query("SELECT id, email FROM users WHERE token=$1", [req.params.token]);
+    const r = await pool.query("SELECT id, email, cal_token FROM users WHERE token=$1", [req.params.token]);
     if (!r.rows[0]) {
       return res.status(401).json({ jsonrpc: "2.0", error: { code: -32001, message: "Invalid connector link" }, id: null });
     }

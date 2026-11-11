@@ -21,8 +21,19 @@
   .connect p { margin:0 0 10px; color:var(--muted); font-size:14px; }
   .url { display:flex; gap:8px; }
   .url input { flex:1; padding:9px 11px; border:1px solid var(--line); border-radius:8px; font-family: ui-monospace, Menlo, monospace; font-size:13px; background:#fafbfd; }
-  .cards { display:grid; grid-template-columns: repeat(3, 1fr); gap:14px; margin-bottom:20px; }
-  @media (max-width: 700px) { .cards { grid-template-columns: 1fr; } }
+  .cards { display:grid; grid-template-columns: repeat(4, 1fr); gap:14px; margin-bottom:20px; }
+  @media (max-width: 860px) { .cards { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 520px) { .cards { grid-template-columns: 1fr; } }
+  .stat.saved div { color:#137a3f; }
+  .links { display:grid; grid-template-columns: 1fr 1fr; gap:14px; margin-bottom:20px; }
+  .links .connect { margin-bottom:0; }
+  @media (max-width: 860px) { .links { grid-template-columns: 1fr; } }
+  .dec { display:inline-block; padding:3px 9px; border-radius:99px; font-size:12px; font-weight:600; text-transform:capitalize; }
+  .dec.undecided { background:#eef0f6; color:var(--muted); }
+  .dec.keep { background:#e3f1ff; color:#1d5fa8; }
+  .dec.cancel { background:#e2f6ea; color:#137a3f; }
+  .dec.renegotiate { background:#fff3dc; color:var(--amber); }
+  tr.cancelled td:not(:last-child) { opacity:.6; }
   .stat { background:#fff; border:1px solid var(--line); border-radius:12px; padding:16px 18px; }
   .stat small { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.5px; }
   .stat div { font-size:24px; font-weight:700; margin-top:6px; }
@@ -58,14 +69,22 @@
   <div><span id="who"></span><button class="btn" id="logout">Log out</button></div>
 </header>
 <main>
-  <div class="connect">
-    <h3>Connect to Claude</h3>
-    <p>In Claude, go to Settings, then Connectors, then Add custom connector. Paste this private link. Do not share it.</p>
-    <div class="url"><input id="mcp" readonly><button class="btn" id="copy">Copy</button></div>
+  <div class="links">
+    <div class="connect">
+      <h3>Connect to Claude</h3>
+      <p>In Claude: Settings, Connectors, Add custom connector. Paste this private link, choose "No sign-in". Do not share it.</p>
+      <div class="url"><input id="mcp" readonly><button class="btn" id="copy">Copy</button></div>
+    </div>
+    <div class="connect">
+      <h3>Add to your calendar</h3>
+      <p>In Google Calendar: Other calendars, +, From URL. Paste this link. Every renewal and reminder shows up and stays in sync.</p>
+      <div class="url"><input id="cal" readonly><button class="btn" id="copyCal">Copy</button></div>
+    </div>
   </div>
 
   <div class="cards">
     <div class="stat"><small>Monthly spend</small><div id="sMonthly">-</div></div>
+    <div class="stat saved"><small>Saved per year</small><div id="sSaved">-</div></div>
     <div class="stat"><small>Due in 30 days</small><div id="sDue">-</div></div>
     <div class="stat"><small>Tracked renewals</small><div id="sCount">-</div></div>
   </div>
@@ -94,6 +113,13 @@
       <div><label for="notice_days">Alert me (days before)</label><input id="notice_days" type="number" min="0" max="365"></div>
       <div class="chk"><input id="auto_renews" type="checkbox"><label for="auto_renews" style="margin:0">Auto-renews</label></div>
     </div>
+    <label for="decision">Decision</label>
+    <select id="decision">
+      <option value="undecided">Undecided</option>
+      <option value="keep">Keep</option>
+      <option value="cancel">Cancel (counts as money saved)</option>
+      <option value="renegotiate">Renegotiate</option>
+    </select>
     <label for="owner">Owner</label><input id="owner">
     <label for="notes">Notes</label><textarea id="notes" rows="3"></textarea>
     <div class="err" id="err"></div>
@@ -131,15 +157,22 @@
   const money = (n, c) => `${c} ${Number(n).toLocaleString("en-IN", { maximumFractionDigits: 0 })}`;
 
   function render() {
-    const by = {};
+    const by = {}, saved = {};
     let due = 0;
     for (const r of rows) {
-      by[r.currency] = (by[r.currency] || 0) + r.amount / MONTHS[r.billing_cycle];
+      const monthly = r.amount / MONTHS[r.billing_cycle];
+      if (r.decision === "cancel") {
+        saved[r.currency] = (saved[r.currency] || 0) + monthly * 12;
+        continue;
+      }
+      by[r.currency] = (by[r.currency] || 0) + monthly;
       const d = daysLeft(r.renewal_date);
       if (d >= 0 && d <= 30) due++;
     }
     const parts = Object.entries(by).map(([c, v]) => money(v, c));
+    const savedParts = Object.entries(saved).map(([c, v]) => money(v, c));
     $("#sMonthly").textContent = parts.length ? parts.join(" + ") : "-";
+    $("#sSaved").textContent = savedParts.length ? savedParts.join(" + ") : "-";
     $("#sDue").textContent = rows.length ? due : "-";
     $("#sCount").textContent = rows.length;
 
@@ -154,15 +187,17 @@
       else if (d === 0) { label = "Today"; cls += " urgent"; }
       else if (r.auto_renews && d <= r.notice_days) cls += " urgent";
       else if (d <= 30) cls += " soon";
-      return `<tr class="row" data-id="${r.id}">
+      const dec = r.decision || "undecided";
+      return `<tr class="row${dec === "cancel" ? " cancelled" : ""}" data-id="${r.id}">
         <td><b>${esc(r.vendor)}</b><br><small style="color:#5d6472">${esc(r.plan || "")}</small></td>
         <td>${esc(money(r.amount, r.currency))} <small style="color:#5d6472">/ ${esc(r.billing_cycle)}</small></td>
         <td>${esc(r.renewal_date)}</td>
         <td><span class="${cls}">${esc(label)}</span></td>
         <td>${r.auto_renews ? "Auto" : "Manual"}</td>
-        <td>${esc(r.owner || "")}</td></tr>`;
+        <td>${esc(r.owner || "")}</td>
+        <td><span class="dec ${esc(dec)}">${esc(dec)}</span></td></tr>`;
     }).join("");
-    $("#list").innerHTML = `<table><thead><tr><th>Vendor</th><th>Cost</th><th>Renews</th><th>In</th><th>Type</th><th>Owner</th></tr></thead><tbody>${body}</tbody></table>`;
+    $("#list").innerHTML = `<table><thead><tr><th>Vendor</th><th>Cost</th><th>Renews</th><th>In</th><th>Type</th><th>Owner</th><th>Decision</th></tr></thead><tbody>${body}</tbody></table>`;
     document.querySelectorAll("tr.row").forEach((tr) => (tr.onclick = () => openForm(rows.find((x) => x.id == tr.dataset.id))));
   }
 
@@ -171,8 +206,9 @@
     $("#dTitle").textContent = r ? "Edit renewal" : "Add renewal";
     $("#del").style.display = r ? "" : "none";
     $("#err").textContent = "";
-    const v = r || { vendor: "", plan: "", amount: "", currency: "INR", billing_cycle: "yearly", renewal_date: "", notice_days: 14, auto_renews: true, owner: "", notes: "" };
-    for (const k of ["vendor", "plan", "amount", "currency", "billing_cycle", "renewal_date", "notice_days", "owner", "notes"]) $("#" + k).value = v[k] ?? "";
+    const v = r || { vendor: "", plan: "", amount: "", currency: "INR", billing_cycle: "yearly", renewal_date: "", notice_days: 14, auto_renews: true, owner: "", notes: "", decision: "undecided" };
+    for (const k of ["vendor", "plan", "amount", "currency", "billing_cycle", "renewal_date", "notice_days", "owner", "notes", "decision"]) $("#" + k).value = v[k] ?? "";
+    if (!$("#decision").value) $("#decision").value = "undecided";
     $("#auto_renews").checked = !!v.auto_renews;
     $("#dlg").showModal();
   }
@@ -181,6 +217,7 @@
     const me = await api("/api/me");
     $("#who").textContent = me.email;
     $("#mcp").value = me.mcp_url;
+    $("#cal").value = me.calendar_url;
     rows = (await api("/api/renewals")).renewals;
     render();
     const e = new URLSearchParams(location.search).get("edit");
@@ -194,6 +231,7 @@
   $("#add").onclick = () => openForm(null);
   $("#cancel").onclick = () => $("#dlg").close();
   $("#copy").onclick = async () => { await navigator.clipboard.writeText($("#mcp").value); toast("Link copied"); };
+  $("#copyCal").onclick = async () => { await navigator.clipboard.writeText($("#cal").value); toast("Calendar link copied"); };
   $("#logout").onclick = async () => { await api("/api/logout", { method: "POST" }); location.href = "/"; };
   $("#alerts").onclick = async () => {
     try {
@@ -210,7 +248,7 @@
   $("#form").onsubmit = async (e) => {
     e.preventDefault();
     const body = {};
-    for (const k of ["vendor", "plan", "amount", "currency", "billing_cycle", "renewal_date", "notice_days", "owner", "notes"]) body[k] = $("#" + k).value;
+    for (const k of ["vendor", "plan", "amount", "currency", "billing_cycle", "renewal_date", "notice_days", "owner", "notes", "decision"]) body[k] = $("#" + k).value;
     body.auto_renews = $("#auto_renews").checked;
     if (body.amount === "") body.amount = 0;
     if (body.notice_days === "") body.notice_days = 14;
